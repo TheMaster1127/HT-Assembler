@@ -79,7 +79,6 @@ _start:
 	mov rdi, r13
 	mov rsi, 0
 	call print_number
-	.cloop1_end0:
 	inc r13
 	dec r12
 	jmp .loop1_0
