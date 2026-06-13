@@ -4,8 +4,8 @@ segment readable writeable
 print_buffer   rb 21
 minus_sign     db '-'
 nl   db 10
-ASM_STR_TEMP_PRINT_1 db "Hello World", 10
-ASM_STR_TEMP_PRINT_1_len = $-ASM_STR_TEMP_PRINT_1
+hello_world_string db "Hello World", 10
+hello_world_string_len = $-hello_world_string
 segment readable executable
 
 print_number:
@@ -66,25 +66,21 @@ _start:
 	mov rbp, rsp
 	and rsp, -16
 
-	push r12
-	push r13
 	xor r13, r13
 	mov r12, 5
-	.loop1_0:
+	.loop:
 	cmp r12, 0
-	je .loop1_end0
-	mov rsi, ASM_STR_TEMP_PRINT_1
-	mov rdx, ASM_STR_TEMP_PRINT_1_len
+	je .loop_end
+	mov rsi, hello_world_string
+	mov rdx, hello_world_string_len
 	call print_str
 	mov rdi, r13
 	mov rsi, 0
 	call print_number
 	inc r13
 	dec r12
-	jmp .loop1_0
-	.loop1_end0:
-	pop r13
-	pop r12
+	jmp .loop
+	.loop_end:
 	
 	mov rsp, rbp
 	pop rbp
