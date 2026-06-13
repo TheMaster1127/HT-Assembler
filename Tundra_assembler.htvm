@@ -1,0 +1,2568 @@
+
+
+___cpp start
+#include <fstream>
+#include <vector>
+#include <string>
+#include <cctype>
+#include <algorithm>
+#include <stdexcept>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <cstdint>
+
+
+
+// POSIX permissions support
+#ifdef __unix__
+#include <sys/stat.h>
+#endif
+
+/**
+ * @brief Writes raw bytes to a file and optionally makes it executable.
+ *
+ * Each element of @p hex_bytes is trimmed, lowercased, and converted from a
+ * two‑character hex string (e.g., "FF", "03") into its raw byte value.
+ * The file is created/truncated and written in binary mode.
+ *
+ * If @p make_executable is true (default) and the operating system is POSIX,
+ * the file’s permissions are set to 0755 (rwxr-xr-x) after writing.
+ *
+ * @param filename        Path to the output file.
+ * @param hex_bytes       Vector of hex strings, one byte each.
+ * @param make_executable Whether to set executable permissions on POSIX systems.
+ * @throws std::invalid_argument if a hex string is invalid.
+ * @throws std::ios_base::failure if the file cannot be opened.
+ * @throws std::runtime_error if chmod fails (POSIX only).
+ */
+void final_assemble(const std::string& filename,
+                    const std::vector<std::string>& hex_bytes,
+                    bool make_executable = true) {
+    // Open the file in binary mode, overwriting any existing content
+    std::ofstream out(filename, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!out) {
+        throw std::ios_base::failure("Cannot open file: " + filename);
+    }
+
+    // Write each byte
+    for (const auto& raw : hex_bytes) {
+        // 1. Trim whitespace
+        auto start = raw.find_first_not_of(" \t\n\r\f\v");
+        if (start == std::string::npos) {
+            throw std::invalid_argument("Hex string is empty or only whitespace.");
+        }
+        auto end = raw.find_last_not_of(" \t\n\r\f\v");
+        std::string trimmed = raw.substr(start, end - start + 1);
+
+        // 2. Lowercase (optional, stoul handles both cases)
+        std::transform(trimmed.begin(), trimmed.end(), trimmed.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        // 3. Validate length (exactly 2 hex digits)
+        if (trimmed.length() != 2) {
+            throw std::invalid_argument(
+                "Hex string must be exactly 2 characters: \"" + trimmed + "\"");
+        }
+
+        // 4. Convert to unsigned long (0x00–0xFF)
+        unsigned long byte_val;
+        try {
+            byte_val = std::stoul(trimmed, nullptr, 16);
+        } catch (const std::invalid_argument&) {
+            throw std::invalid_argument("Invalid hex characters in: \"" + trimmed + "\"");
+        } catch (const std::out_of_range&) {
+            throw std::invalid_argument("Hex value out of range (00..FF): \"" + trimmed + "\"");
+        }
+        if (byte_val > 0xFF) {
+            throw std::invalid_argument("Byte value exceeds 0xFF: \"" + trimmed + "\"");
+        }
+
+        // 5. Write raw byte
+        out.put(static_cast<unsigned char>(byte_val));
+    }
+
+    // Close the file (important before changing permissions)
+    out.close();
+    if (!out) {
+        throw std::ios_base::failure("Failed to close file after writing.");
+    }
+
+    // Make executable on POSIX systems if requested
+#ifdef __unix__
+    if (make_executable) {
+        // 0755 = rwxr-xr-x
+        if (chmod(filename.c_str(), S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0) {
+            throw std::runtime_error("chmod failed on file: " + filename);
+        }
+    }
+#else
+    // On non‑POSIX systems this flag is silently ignored (no error)
+    (void)make_executable;
+#endif
+}
+
+
+std::vector<std::string> size_to_hex32(uint32_t size_in_bytes) {
+    std::vector<std::string> pairs;
+    for (int i = 0; i < 4; i++) {
+        uint8_t byte = (size_in_bytes >> (i * 8)) & 0xFF;
+        std::stringstream ss;
+        ss << std::hex << std::setw(2) << std::setfill('0') << (int)byte;
+        pairs.push_back(ss.str());
+    }
+    return pairs;
+}
+
+
+// This function takes a 32-bit input but pads it out to an 8-byte (64-bit) little-endian format.
+// It loops 8 times to generate 8 hex pairs, filling the upper 4 bytes with "00".
+std::string size_to_hex64(uint64_t size_in_bytes) {
+    std::string result;
+    for (int i = 0; i < 8; i++) {
+        uint8_t byte = (size_in_bytes >> (i * 8)) & 0xFF;
+        std::stringstream ss;
+        ss << std::hex << std::setw(2) << std::setfill('0') << (int)byte;
+        result += ss.str();
+        if (i < 7) result += " ";
+    }
+    return result;
+}
+
+
+std::string address_to_hexstr(uint64_t addr, int min_digits = 0) {
+    std::stringstream ss;
+    ss << "0x" << std::hex << std::setfill('0');
+    if (min_digits > 0) {
+        ss << std::setw(min_digits);
+    }
+    ss << addr;
+    return ss.str();
+}
+
+std::string char_to_hex(std::string c) {
+    std::stringstream ss;
+    ss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)c[0];
+    return ss.str();
+}
+
+///////////////////////////////////////////////////
+///////////////////////////////////////////////////
+///////////////////////////////////////////////////
+
+int64_t parse_number(const std::string& input) {
+    if (input.empty()) {
+        throw std::invalid_argument("empty string");
+    }
+
+    size_t pos = 0;
+    bool negative = false;
+    std::string s = input;
+
+    // Check for leading minus sign
+    if (s[0] == '-') {
+        negative = true;
+        s = s.substr(1);
+        if (s.empty()) {
+            throw std::invalid_argument("invalid number: just '-'");
+        }
+    }
+
+    // Determine base
+    int base = 10;
+    if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        base = 16;
+        s = s.substr(2);
+        if (s.empty()) {
+            throw std::invalid_argument("invalid hex number: missing digits");
+        }
+    }
+
+    // Convert the remaining string
+    uint64_t value = 0;
+    for (char c : s) {
+        int digit;
+        if (c >= '0' && c <= '9') {
+            digit = c - '0';
+        } else if (base == 16 && c >= 'a' && c <= 'f') {
+            digit = c - 'a' + 10;
+        } else if (base == 16 && c >= 'A' && c <= 'F') {
+            digit = c - 'A' + 10;
+        } else {
+            throw std::invalid_argument("invalid character '" + std::string(1, c) + "' for base " + std::to_string(base));
+        }
+        if (value > (UINT64_MAX - digit) / base) { // overflow check
+            throw std::out_of_range("number too large for 64-bit");
+        }
+        value = value * base + digit;
+    }
+
+    // Apply sign and cast to int64_t (two's complement)
+    if (negative) {
+        if (value > static_cast<uint64_t>(INT64_MAX) + 1) {
+            throw std::out_of_range("negative number too small (underflow)");
+        }
+        return -static_cast<int64_t>(value);
+    } else {
+        if (value > static_cast<uint64_t>(INT64_MAX)) {
+            throw std::out_of_range("positive number too large for int64_t");
+        }
+        return static_cast<int64_t>(value);
+    }
+}
+
+void print_hex(uint64_t decimal) {
+    std::cout << "0x" << std::hex << std::setw(16) << std::setfill('0') << decimal << std::endl;
+}
+
+std::string dec_to_hex_pair(uint8_t decimal) {
+    std::stringstream ss;
+    ss << std::hex << std::setw(2) << std::setfill('0') << (int)decimal;
+    return ss.str();
+}
+
+
+
+// This function converts a 32-bit decimal number to a 4-byte little-endian hexadecimal string.
+// Little Endian means the least significant byte (lowest value) is stored and printed first.
+std::string dec_to_hex_4byte_le(uint32_t decimal) {
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    
+    // Extract and format each of the 4 bytes, starting with the lowest byte (Little Endian)
+    // The output string will separate each byte with a space exactly as requested.
+    ss << std::setw(2) << static_cast<int>((decimal >> 0) & 0xFF) << " "   // Byte 1: Lowest byte
+       << std::setw(2) << static_cast<int>((decimal >> 8) & 0xFF) << " "   // Byte 2
+       << std::setw(2) << static_cast<int>((decimal >> 16) & 0xFF) << " "  // Byte 3
+       << std::setw(2) << static_cast<int>((decimal >> 24) & 0xFF);         // Byte 4: Highest byte
+       
+    return ss.str();
+}
+
+
+
+
+
+
+std::string calculate_jmp_string(const std::string& target_hex_str) {
+    std::stringstream ss(target_hex_str);
+    std::string byte_str;
+    uint32_t address = 0;
+    int shift = 0;
+    
+    // 1. Parse the spaced little-endian string into a raw integer
+    while (ss >> byte_str) {
+        uint32_t byte_val = std::stoul(byte_str, nullptr, 16);
+        address |= (byte_val << shift);
+        shift += 8;
+    }
+    
+    // 2. Apply your numerical offset subtraction
+    // Change '5' to whatever number your compilation pass requires
+    uint32_t offset_address = address - 5; 
+    
+    // 3. Format it back to a spaced 4-byte little-endian hex string
+    std::stringstream out_ss;
+    out_ss << std::hex << std::setfill('0');
+    out_ss << std::setw(2) << ((offset_address >> 0) & 0xFF) << " "
+           << std::setw(2) << ((offset_address >> 8) & 0xFF) << " "
+           << std::setw(2) << ((offset_address >> 16) & 0xFF) << " "
+           << std::setw(2) << ((offset_address >> 24) & 0xFF);
+           
+    return out_ss.str();
+}
+
+void HTVM_Append(std::vector<int64_t>& arr, int64_t value) {
+    arr.push_back(value);
+}
+
+// OVERLOAD: If the input is already a number (size_t), just return it directly
+int INT(size_t num) {
+    return static_cast<int>(num);
+}
+
+___cpp end
+
+
+include "HT-Lib.htvm"
+; =========================================================================
+; GLOBAL ASSEMBLER STATE
+; =========================================================================
+int use_custom_assembler_x86_64_linux := 0
+
+arr str label_names
+___cpp start
+std::vector<int64_t> label_values;
+___cpp end
+uint64 current_address := 0
+bool is_first_pass := false
+
+func void add_label(str name, int64 addr) {
+    label_names.add(name)
+    label_values.add(addr)
+}
+
+func int64 get_label_address(str name) {
+    Loop, label_names.size() {
+        if (name = label_names[A_Index]) {
+            return label_values[A_Index]
+        }
+    }
+    return -1
+}
+
+func void set_current_address(uint64 addr) {
+    current_address := addr
+}
+
+func uint64 get_current_address() {
+    return current_address
+}
+
+func void set_first_pass(bool pass_state) {
+    is_first_pass := pass_state
+}
+
+func int get_byte_count(str hex_str) {
+    if (hex_str = "NULL" or hex_str = "") {
+        return 0
+    }
+    int count := 0
+    ; Using Parse instead of StrSplit ensures we never go out of bounds
+    Loop, Parse, hex_str, " " {
+        if (Trim(A_LoopField) != "") {
+            count++
+        }
+    }
+    return count
+}
+
+
+
+; Helper: convert string to boolean (InStr returns position, so >0 means true)
+func bool is_mem(str op) {
+    return (InStr(op, "[") > 0)
+}
+
+func bool is_imm(str op) {
+    op := Trim(op)
+    if (RegExMatch(op, "^-?[0-9]+$") > 0) { return true }
+    if (RegExMatch(op, "^-?0x[0-9a-fA-F]+$") > 0) { return true }
+    if (RegExMatch(op, "^'.*'$") > 0) { return true }
+    return false
+}
+
+; Returns "id|size" e.g. "0|64" for rax, "1|32" for ecx, "15|8" for r15b
+func str get_reg_info(str name) {
+    arr str regs_64 := ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+    arr str regs_32 := ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"]
+    arr str regs_16 := ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"]
+    arr str regs_8  := ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"]
+    arr str regs_high := ["ah", "ch", "dh", "bh"]
+
+    name := StrReplace(name, "qword ", "")
+    name := StrReplace(name, "dword ", "")
+    name := StrReplace(name, "word ", "")
+    name := StrReplace(name, "byte ", "")
+    name := StrReplace(name, "[", "")
+    name := StrReplace(name, "]", "")
+    name := Trim(name)
+
+    Loop, regs_64.size() {
+        if (name = regs_64[A_Index]) { return STR(A_Index) . "|64" }
+    }
+    Loop, regs_32.size() {
+        if (name = regs_32[A_Index]) { return STR(A_Index) . "|32" }
+    }
+    Loop, regs_16.size() {
+        if (name = regs_16[A_Index]) { return STR(A_Index) . "|16" }
+    }
+    Loop, regs_8.size() {
+        if (name = regs_8[A_Index]) { return STR(A_Index) . "|8" }
+    }
+    Loop, regs_high.size() {
+        if (name = regs_high[A_Index]) { return STR(A_Index + 4) . "|8" }
+    }
+    return "-1|0"
+}
+
+func int get_reg_id(str name, arr str registers) {
+
+    name := StrReplace(name, "qword ", "")
+    name := StrReplace(name, "dword ", "")
+    name := StrReplace(name, "word ", "")
+    name := StrReplace(name, "byte ", "")
+    name := StrReplace(name, "[", "")
+    name := StrReplace(name, "]", "")
+    name := Trim(name)
+    
+    Loop, registers.size() {
+        if (name = registers[A_Index]) {
+            return A_Index
+        }
+    }
+    return -1
+}
+
+; Helper to map mnemonics to opcodes
+func int get_mnemonic_info(str name, str info_type) {
+    if (name = "add") {
+        if (info_type = "base_op") { return 0x00 }
+        if (info_type = "imm_ext") { return 0 }
+    } else if (name = "or") {
+        if (info_type = "base_op") { return 0x08 }
+        if (info_type = "imm_ext") { return 1 }
+    } else if (name = "adc") {
+        if (info_type = "base_op") { return 0x10 }
+        if (info_type = "imm_ext") { return 2 }
+    } else if (name = "sbb") {
+        if (info_type = "base_op") { return 0x18 }
+        if (info_type = "imm_ext") { return 3 }
+    } else if (name = "and") {
+        if (info_type = "base_op") { return 0x20 }
+        if (info_type = "imm_ext") { return 4 }
+    } else if (name = "sub") {
+        if (info_type = "base_op") { return 0x28 }
+        if (info_type = "imm_ext") { return 5 }
+    } else if (name = "xor") {
+        if (info_type = "base_op") { return 0x30 }
+        if (info_type = "imm_ext") { return 6 }
+    } else if (name = "cmp") {
+        if (info_type = "base_op") { return 0x38 }
+        if (info_type = "imm_ext") { return 7 }
+    }
+    return -1
+}
+
+func int get_jcc_code(str name) {
+    if (name = "jo") { return 0 }
+    if (name = "jno") { return 1 }
+    if (name = "jb" or name = "jc" or name = "jnae") { return 2 }
+    if (name = "jnb" or name = "jnc" or name = "jae") { return 3 }
+    if (name = "je" or name = "jz") { return 4 }
+    if (name = "jne" or name = "jnz") { return 5 }
+    if (name = "jbe" or name = "jna") { return 6 }
+    if (name = "jnbe" or name = "ja") { return 7 }
+    if (name = "js") { return 8 }
+    if (name = "jns") { return 9 }
+    if (name = "jp" or name = "jpe") { return 10 }
+    if (name = "jnp" or name = "jpo") { return 11 }
+    if (name = "jl" or name = "jnge") { return 12 }
+    if (name = "jnl" or name = "jge") { return 13 }
+    if (name = "jle" or name = "jng") { return 14 }
+    if (name = "jg" or name = "jnle") { return 15 }
+    return -1
+}
+
+
+
+func str encode(str instruction) {
+    bool dest_is_mem := false
+    bool src_is_mem := false
+    bool src_is_imm := false
+    bool mem_is_imm := false
+    bool force_rex := false
+    int disp_size := 0
+    int64 disp := 0
+    uint64 REX := 0x40
+    uint64 opcode := 0
+    uint64 modrm := 0
+    uint64 sib := 0
+    int64 imm_val := 0
+    str out_hex := ""
+    str dest_op := ""
+    str src_op := ""
+    str str0 := ""
+    bool has_0F := false
+
+    instruction := Trim(instruction)
+    arr str registers := ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+
+    if (instruction = "syscall") { return "0f 05" }
+    if (instruction = "rep movsq") { return "f3 48 a5" }
+
+    int space_pos := InStr(instruction, " ")
+    str mnemonic := "mov"
+    str ops_str := ""
+    if (space_pos > 0) {
+        mnemonic := Trim(SubStr(instruction, 1, space_pos))
+        ops_str := Trim(SubStr(instruction, space_pos + 1))
+    }
+
+    int first_comma := InStr(ops_str, ",")
+    if (first_comma > 0) {
+        dest_op := Trim(SubStr(ops_str, 1, first_comma - 1))
+        src_op  := Trim(SubStr(ops_str, first_comma + 1))
+    } else {
+        dest_op := Trim(ops_str)
+        src_op  := ""
+    }
+
+    bool is_imul_3_op := false
+    str imul_imm_str := ""
+    if (mnemonic = "imul") {
+        str op3 := Trim(StrSplit(ops_str, ",", 3))
+        if (op3 != "") {
+            is_imul_3_op := true
+            dest_op := Trim(StrSplit(ops_str, ",", 1))
+            src_op := Trim(StrSplit(ops_str, ",", 2))
+            imul_imm_str := op3
+        }
+    }
+
+    dest_is_mem := InStr(dest_op, "[")
+    src_is_mem  := InStr(src_op, "[")
+    src_is_imm  := is_imm(src_op)
+    bool dest_is_imm := is_imm(dest_op)
+    
+    if (instruction = "ret") {
+        if (dest_op = "") { return "c3" }
+        int64 imm := parse_number(dest_op)
+        return "c2 " . dec_to_hex_pair(imm & 0xFF) . " " . dec_to_hex_pair((imm >> 8) & 0xFF)
+    }
+    if (mnemonic = "push" and dest_is_imm) {
+        int64 imm := parse_number(dest_op)
+        if (imm >= -128 and imm <= 127) { return "6a " . dec_to_hex_pair(imm & 0xFF) } 
+        else if (imm >= -2147483648 and imm <= 2147483647) {
+            return "68 " . dec_to_hex_pair(imm & 0xFF) . " " . dec_to_hex_pair((imm >> 8) & 0xFF) . " " . dec_to_hex_pair((imm >> 16) & 0xFF) . " " . dec_to_hex_pair((imm >> 24) & 0xFF)
+        }
+        return "NULL" 
+    }
+    if (mnemonic = "int" and dest_is_imm) {
+        int64 imm := parse_number(dest_op)
+        return (imm = 3) ? "cc" : ("cd " . dec_to_hex_pair(imm & 0xFF))
+    }
+
+    if (dest_is_mem and src_is_mem) { return "NULL" }
+
+    bool dest_has_high := (dest_op = "ah" or dest_op = "ch" or dest_op = "dh" or dest_op = "bh")
+    bool src_has_high  := (src_op = "ah" or src_op = "ch" or src_op = "dh" or src_op = "bh")
+    bool has_high_byte := (dest_has_high or src_has_high)
+
+    bool is_direct_jump_or_call := false
+    if (mnemonic = "call" or SubStr(mnemonic, 1, 1) = "j") {
+        if (RegExMatch(dest_op, "^-?(0x)?[0-9a-fA-F]+$")) {
+            is_direct_jump_or_call := true
+        } else {
+            int64 label_addr := get_label_address(dest_op)
+            if (label_addr != -1 or is_first_pass) {
+                is_direct_jump_or_call := true
+            }
+        }
+    }
+
+    if (SubStr(mnemonic, 1, 1) = "j" and mnemonic != "jmp") {
+        if (is_direct_jump_or_call = false) { return "NULL" }
+    }
+
+    if (is_direct_jump_or_call) {
+        int64 target := 0
+        bool is_label := (RegExMatch(dest_op, "^-?(0x)?[0-9a-fA-F]+$") = 0)
+        int64 label_addr := get_label_address(dest_op)
+        
+        if (label_addr != -1) {
+            target := label_addr
+        } else {
+            if (is_label = false) {
+                target := parse_number(dest_op)
+            } else {
+                if (is_first_pass) {
+                    if (mnemonic = "call") { return "e8 00 00 00 00" }
+                    else if (mnemonic = "jmp") { return "e9 00 00 00 00" }
+                    else {
+                        int cc := get_jcc_code(mnemonic)
+                        return "0f " . dec_to_hex_pair(0x80 + cc) . " 00 00 00 00"
+                    }
+                } else {
+                    return "NULL"
+                }
+            }
+        }
+
+        if (mnemonic = "call") {
+            int64 offset := target - (4194304 + current_address + 5)
+            out_hex := "e8"
+            out_hex .= " " . dec_to_hex_pair(offset & 0xFF) . " " . dec_to_hex_pair((offset >> 8) & 0xFF) . " " . dec_to_hex_pair((offset >> 16) & 0xFF) . " " . dec_to_hex_pair((offset >> 24) & 0xFF)
+            return out_hex
+        }
+        else if (mnemonic = "jmp") {
+            if (is_label) {
+                int64 offset32 := target - (4194304 + current_address + 5)
+                out_hex := "e9"
+                out_hex .= " " . dec_to_hex_pair(offset32 & 0xFF) . " " . dec_to_hex_pair((offset32 >> 8) & 0xFF) . " " . dec_to_hex_pair((offset32 >> 16) & 0xFF) . " " . dec_to_hex_pair((offset32 >> 24) & 0xFF)
+                return out_hex
+            } else {
+                int64 offset8 := target - (4194304 + current_address + 2)
+                if (offset8 >= -128 and offset8 <= 127) {
+                    out_hex := "eb " . dec_to_hex_pair(offset8 & 0xFF)
+                } else {
+                    int64 offset32 := target - (4194304 + current_address + 5)
+                    out_hex := "e9"
+                    out_hex .= " " . dec_to_hex_pair(offset32 & 0xFF) . " " . dec_to_hex_pair((offset32 >> 8) & 0xFF) . " " . dec_to_hex_pair((offset32 >> 16) & 0xFF) . " " . dec_to_hex_pair((offset32 >> 24) & 0xFF)
+                }
+                return out_hex
+            }
+        }
+        else {
+            int cc := get_jcc_code(mnemonic)
+            if (is_label) {
+                int64 offset32 := target - (4194304 + current_address + 6)
+                out_hex := "0f " . dec_to_hex_pair(0x80 + cc)
+                out_hex .= " " . dec_to_hex_pair(offset32 & 0xFF) . " " . dec_to_hex_pair((offset32 >> 8) & 0xFF) . " " . dec_to_hex_pair((offset32 >> 16) & 0xFF) . " " . dec_to_hex_pair((offset32 >> 24) & 0xFF)
+                return out_hex
+            } else {
+                int64 offset8 := target - (4194304 + current_address + 2)
+                if (offset8 >= -128 and offset8 <= 127) {
+                    out_hex := dec_to_hex_pair(0x70 + cc) . " " . dec_to_hex_pair(offset8 & 0xFF)
+                } else {
+                    int64 offset32 := target - (4194304 + current_address + 6)
+                    out_hex := "0f " . dec_to_hex_pair(0x80 + cc)
+                    out_hex .= " " . dec_to_hex_pair(offset32 & 0xFF) . " " . dec_to_hex_pair((offset32 >> 8) & 0xFF) . " " . dec_to_hex_pair((offset32 >> 16) & 0xFF) . " " . dec_to_hex_pair((offset32 >> 24) & 0xFF)
+                }
+                return out_hex
+            }
+        }
+    }
+    
+    int inst_len := 6
+    str dest_info := get_reg_info(dest_op)
+    int dest_reg_id := INT(StrSplit(dest_info, "|", 1))
+    int dest_reg_sz := INT(StrSplit(dest_info, "|", 2))
+
+    str src_info := get_reg_info(src_op)
+    int src_reg_id := INT(StrSplit(src_info, "|", 1))
+    int src_reg_sz := INT(StrSplit(src_info, "|", 2))
+
+    int d_sz := 0
+    int s_sz := 0
+    if (dest_is_mem = false) { d_sz := dest_reg_sz }
+    if (src_is_mem = false) { s_sz := src_reg_sz }
+
+    int op_size := 64
+    if (d_sz > 0) { op_size := d_sz }
+    else if (s_sz > 0) { op_size := s_sz }
+    else if (InStr(dest_op, "qword") or InStr(src_op, "qword")) { op_size := 64 }
+    else if (InStr(dest_op, "dword") or InStr(src_op, "dword")) { op_size := 32 }
+    else if (InStr(dest_op, "word") or InStr(src_op, "word")) { op_size := 16 }
+    else if (InStr(dest_op, "byte") or InStr(src_op, "byte")) { op_size := 8 }
+
+    if (mnemonic = "jmp" or mnemonic = "call" or mnemonic = "push" or mnemonic = "pop") {
+    } else {
+        if (op_size = 64) { REX += 0x08 } 
+    }
+
+    if (op_size = 16) { out_hex := "66 " }
+
+    if (dest_is_mem = false and dest_reg_sz = 8 and dest_reg_id >= 4 and dest_reg_id <= 7 and dest_has_high = false) { force_rex := true }
+    if (src_is_mem = false and src_is_imm = false and src_reg_sz = 8 and src_reg_id >= 4 and src_reg_id <= 7 and src_has_high = false) { force_rex := true }
+
+    bool is_shift_rotate := (mnemonic = "shl" or mnemonic = "shr" or mnemonic = "sar" or mnemonic = "sal" or mnemonic = "rol" or mnemonic = "ror" or mnemonic = "rcl" or mnemonic = "rcr")
+    int ext := 0
+    if (is_shift_rotate) {
+        if (mnemonic = "rol") { ext := 0 }
+        else if (mnemonic = "ror") { ext := 1 }
+        else if (mnemonic = "rcl") { ext := 2 }
+        else if (mnemonic = "rcr") { ext := 3 }
+        else if (mnemonic = "shl" or mnemonic = "sal") { ext := 4 }
+        else if (mnemonic = "shr") { ext := 5 }
+        else if (mnemonic = "sar") { ext := 7 }
+    }
+
+    if (dest_is_mem or src_is_mem) {
+        str mem_str := ""
+        int reg_id := 0
+        int mem_size := 64
+        
+        if (dest_is_mem) {
+            mem_str := dest_op
+            if (InStr(mem_str, "byte")) { mem_size := 8 }
+            else if (InStr(mem_str, "word")) { mem_size := 16 }
+            else if (InStr(mem_str, "dword")) { mem_size := 32 }
+            
+            if (src_is_imm and is_shift_rotate = false) {
+                mem_is_imm := true
+                str trim_src := Trim(src_op)
+                if (RegExMatch(trim_src, "^'.*'$") > 0) {
+                    str char1 := StrReplace(trim_src, "'", "")
+                    imm_val := Asc(Trim(char1))
+                } else {
+                    imm_val := parse_number(trim_src)
+                }
+                if (mnemonic = "mov") {
+                    opcode := (op_size = 8) ? 0xC6 : 0xC7
+                    reg_id := 0
+                } else if (mnemonic = "test") {
+                    opcode := (op_size = 8) ? 0xF6 : 0xF7
+                    reg_id := 0
+                } else {
+                    if (op_size > 8 and imm_val >= -128 and imm_val <= 127) {
+                        opcode := 0x83
+                    } else {
+                        opcode := (op_size = 8) ? 0x80 : 0x81
+                    }
+                    reg_id := get_mnemonic_info(mnemonic, "imm_ext")
+                }
+            } else if (is_shift_rotate) {
+                if (src_op = "1") {
+                    opcode := (op_size = 8) ? 0xD0 : 0xD1
+                } else if (src_op = "cl") {
+                    opcode := (op_size = 8) ? 0xD2 : 0xD3
+                } else if (src_is_imm) {
+                    opcode := (op_size = 8) ? 0xC0 : 0xC1
+                    mem_is_imm := true
+                    imm_val := parse_number(src_op)
+                } else {
+                    return "NULL"
+                }
+                reg_id := ext
+            } else if (src_op = "") {
+                if (mnemonic = "push" or mnemonic = "pop") {
+                    if (op_size = 8 or op_size = 32) { return "NULL" }
+                    if (mnemonic = "push") {
+                        reg_id := 6
+                        opcode := 0xFF
+                    } else {
+                        reg_id := 0
+                        opcode := 0x8F
+                    }
+                } else {
+                    int ext_single := 0
+                    if (mnemonic = "inc") { ext_single := 0 }
+                    else if (mnemonic = "dec") { ext_single := 1 }
+                    else if (mnemonic = "call") { ext_single := 2 }
+                    else if (mnemonic = "not") { ext_single := 2 }
+                    else if (mnemonic = "neg") { ext_single := 3 }
+                    else if (mnemonic = "jmp") { ext_single := 4 }
+                    else if (mnemonic = "mul") { ext_single := 4 }
+                    else if (mnemonic = "imul") { ext_single := 5 }
+                    else if (mnemonic = "div") { ext_single := 6 }
+                    else if (mnemonic = "idiv") { ext_single := 7 }
+                    
+                    reg_id := ext_single
+                    bool is_group3 := (mnemonic = "not" or mnemonic = "neg" or mnemonic = "mul" or mnemonic = "imul" or mnemonic = "div" or mnemonic = "idiv")
+                    if (mnemonic = "call" or mnemonic = "jmp") {
+                        opcode := 0xFF
+                    } else if (is_group3) {
+                        opcode := (op_size = 8) ? 0xF6 : 0xF7
+                    } else {
+                        opcode := (op_size = 8) ? 0xFE : 0xFF
+                    }
+                }
+            } else {
+                reg_id := src_reg_id
+                if (mnemonic = "mov") {
+                    opcode := (op_size = 8) ? 0x88 : 0x89
+                } else if (mnemonic = "test") {
+                    opcode := (op_size = 8) ? 0x84 : 0x85
+                } else {
+                    int base_op := get_mnemonic_info(mnemonic, "base_op")
+                    opcode := (op_size = 8) ? base_op : (base_op + 1)
+                }
+            }
+        } else {
+            mem_str := src_op
+            if (InStr(mem_str, "byte")) { mem_size := 8 }
+            else if (InStr(mem_str, "word")) { mem_size := 16 }
+            else if (InStr(mem_str, "dword")) { mem_size := 32 }
+            
+            reg_id := dest_reg_id
+            
+            if (mnemonic = "mov") {
+                opcode := (op_size = 8) ? 0x8A : 0x8B
+            } else if (mnemonic = "movzx") {
+                has_0F := true
+                opcode := (mem_size = 8) ? 0xB6 : 0xB7
+            } else if (mnemonic = "movsx") {
+                has_0F := true
+                opcode := (mem_size = 8) ? 0xBE : 0xBF
+            } else if (mnemonic = "movsxd") {
+                opcode := 0x63
+            } else if (mnemonic = "test") {
+                opcode := (op_size = 8) ? 0x84 : 0x85
+            } else if (mnemonic = "lea") {
+                if (op_size = 8) { return "NULL" }
+                opcode := 0x8D
+            } else if (is_imul_3_op) {
+                if (op_size = 8) { return "NULL" }
+                int64 imul_imm_temp := parse_number(imul_imm_str)
+                bool imm_fits_8 := (imul_imm_temp >= -128 and imul_imm_temp <= 127)
+                opcode := imm_fits_8 ? 0x6B : 0x69
+            } else if (mnemonic = "imul") {
+                if (op_size = 8) { return "NULL" }
+                has_0F := true
+                opcode := 0xAF
+            } else {
+                int base_op := get_mnemonic_info(mnemonic, "base_op")
+                opcode := (op_size = 8) ? (base_op + 2) : (base_op + 3)
+            }
+        }
+
+        str inner := StrSplit(mem_str, "[", 2)
+        inner := StrReplace(inner, "]", "")
+        
+        bool is_pure_disp := false
+        if (RegExMatch(inner, "^-?(0x)?[0-9a-fA-F]+$")) {
+            is_pure_disp := true
+            disp := parse_number(inner)
+            disp_size := 4
+            inner := ""
+        }
+
+        bool has_disp := false
+        str val := ""
+        str op := ""
+        
+        if (is_pure_disp = false) {
+            str p3 := Trim(StrSplit(inner, " + ", 3))
+            str p2 := Trim(StrSplit(inner, " + ", 2))
+            
+            if (p3 != "" and RegExMatch(p3, "^-?(0x)?[0-9a-fA-F]+$")) {
+                val := p3
+                op := "+"
+                inner := Trim(StrSplit(inner, " + ", 1)) . " + " . Trim(StrSplit(inner, " + ", 2))
+                has_disp := true
+            } else if (p2 != "" and RegExMatch(p2, "^-?(0x)?[0-9a-fA-F]+$")) {
+                val := p2
+                op := "+"
+                inner := Trim(StrSplit(inner, " + ", 1))
+                has_disp := true
+            }
+            
+            if (has_disp = false) {
+                str m3 := Trim(StrSplit(inner, " - ", 3))
+                str m2 := Trim(StrSplit(inner, " - ", 2))
+                
+                if (m3 != "" and RegExMatch(m3, "^-?(0x)?[0-9a-fA-F]+$")) {
+                    val := m3
+                    op := "-"
+                    inner := Trim(StrSplit(inner, " - ", 1)) . " - " . Trim(StrSplit(inner, " - ", 2))
+                    has_disp := true
+                } else if (m2 != "" and RegExMatch(m2, "^-?(0x)?[0-9a-fA-F]+$")) {
+                    val := m2
+                    op := "-"
+                    inner := Trim(StrSplit(inner, " - ", 1))
+                    has_disp := true
+                }
+            }
+        }
+        
+        if (has_disp) {
+            disp := parse_number(val)
+            if (op = "-") { disp := -disp }
+            if (disp >= -128 and disp <= 127) { disp_size := 1 }
+            else { disp_size := 4 }
+        }
+
+        bool b_is_none := false
+        bool is_sib := InStr(inner, "*")
+
+        int imm_size := 4
+        if (is_pure_disp) {
+            int64 orig_disp := disp
+
+            if (reg_id = 0 and mem_is_imm = false and mnemonic = "mov") {
+                if (dest_is_mem) { opcode := (op_size = 8) ? 0xA2 : 0xA3 } 
+                else { opcode := (op_size = 8) ? 0xA0 : 0xA1 }
+                
+                if (REX > 0x40 or force_rex) {
+                    if (has_high_byte) { return "NULL" }
+                    out_hex .= dec_to_hex_pair(REX) . " "
+                }
+                out_hex .= dec_to_hex_pair(opcode)
+                Loop, 8 {
+                    out_hex .= " " . dec_to_hex_pair((orig_disp >> ((A_Index)*8)) & 0xFF)
+                }
+            } else {
+                if (reg_id >= 8) { REX += 0x04 }
+                
+                if (op_size = 8) { imm_size := 1 }
+                else if (op_size = 16) { imm_size := 2 }
+                if (opcode = 0x83) { imm_size := 1 }
+
+                if (REX > 0x40 or force_rex) { inst_len += 1 }
+                if (op_size = 16) { inst_len += 1 }
+                if (mem_is_imm) { inst_len += imm_size }
+                
+                if (orig_disp >= 0) {
+                    disp := orig_disp - (4194304 + current_address + inst_len)
+                    modrm := 0x05 | ((reg_id & 7) << 3)
+                    
+                    if (REX > 0x40 or force_rex) {
+                        if (has_high_byte) { return "NULL" }
+                        out_hex .= dec_to_hex_pair(REX) . " "
+                    }
+                    if (has_0F) { out_hex .= "0f " }
+                    out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(modrm)
+                } else {
+                    modrm := 0x04 | ((reg_id & 7) << 3)
+                    sib := 0x25
+                    
+                    if (REX > 0x40 or force_rex) {
+                        if (has_high_byte) { return "NULL" }
+                        out_hex .= dec_to_hex_pair(REX) . " "
+                    }
+                    if (has_0F) { out_hex .= "0f " }
+                    out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(modrm) . " " . dec_to_hex_pair(sib)
+                }
+                out_hex .= " " . dec_to_hex_pair(disp & 0xFF) . " " . dec_to_hex_pair((disp >> 8) & 0xFF) . " " . dec_to_hex_pair((disp >> 16) & 0xFF) . " " . dec_to_hex_pair((disp >> 24) & 0xFF)
+            }
+        }
+        else if (is_sib) {
+            str base_reg  := ""
+            str index_reg := ""
+            str scale_str := ""
+            int b_id := 0
+            int i_id := 0
+
+            if (InStr(inner, "+")) {
+                base_reg  := Trim(StrSplit(inner, "+", 1))
+                str rest  := Trim(StrSplit(inner, "+", 2))
+                index_reg := Trim(StrSplit(rest, "*", 1))
+                scale_str := Trim(StrSplit(rest, "*", 2))
+                b_id := get_reg_id(base_reg, registers)
+                i_id := get_reg_id(index_reg, registers)
+            } else {
+                index_reg := Trim(StrSplit(inner, "*", 1))
+                scale_str := Trim(StrSplit(inner, "*", 2))
+                b_id := 5          
+                disp_size := 4     
+                b_is_none := true  
+                i_id := get_reg_id(index_reg, registers)
+            }
+
+            if (scale_str != "1" and scale_str != "2" and scale_str != "4" and scale_str != "8") {
+                return "NULL"
+            }
+
+            if (reg_id >= 8) { REX += 0x04 } 
+            if (i_id >= 8)   { REX += 0x02 } 
+            if (b_id >= 8 and b_is_none = false) { REX += 0x01 } 
+
+            if (disp_size = 0) {
+                if (b_id = 5 or b_id = 13) {
+                    if (b_is_none = false) {
+                        disp_size := 1
+                        disp := 0
+                    }
+                }
+            }
+
+            uint64 mod_bits := 0x00
+            if (disp_size = 1) { mod_bits := 0x40 }
+            else if (disp_size = 4) { mod_bits := 0x80 }
+
+            if (b_is_none) { mod_bits := 0x00 }
+
+            modrm := mod_bits | ((reg_id & 7) << 3) | 0x04
+            
+            int ss := 0
+            if (scale_str = "2") { ss := 1 }
+            else if (scale_str = "4") { ss := 2 }
+            else if (scale_str = "8") { ss := 3 }
+            sib := (ss << 6) | ((i_id & 7) << 3) | (b_id & 7)
+            
+            if (REX > 0x40 or force_rex) {
+                if (has_high_byte) { return "NULL" }
+                out_hex .= dec_to_hex_pair(REX) . " "
+            }
+            if (has_0F) { out_hex .= "0f " }
+            out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(modrm) . " " . dec_to_hex_pair(sib)
+            
+            if (disp_size = 1) {
+                out_hex .= " " . dec_to_hex_pair(disp & 0xFF)
+            } else if (disp_size = 4) {
+                out_hex .= " " . dec_to_hex_pair(disp & 0xFF) . " " . dec_to_hex_pair((disp >> 8) & 0xFF) . " " . dec_to_hex_pair((disp >> 16) & 0xFF) . " " . dec_to_hex_pair((disp >> 24) & 0xFF)
+            }
+        }
+        else {
+            bool b_is_label := (inner != "rip" and get_reg_id(inner, registers) = -1)
+            bool b_is_rip := (inner = "rip" or b_is_label)
+            int b_id := 0
+            
+            if (b_is_rip) {
+                b_id := 5       
+                disp_size := 4  
+                
+                if (b_is_label) {
+                    int64 label_addr := get_label_address(inner)
+                    if (label_addr != -1) {
+                        int inst_len := 6
+                        if (REX > 0x40 or force_rex) { inst_len += 1 }
+                        if (op_size = 16) { inst_len += 1 }
+                        if (mem_is_imm) { inst_len += imm_size }
+                        
+                        int64 target_addr := label_addr
+                        target_addr := target_addr + disp
+                        disp := target_addr - (4194304 + current_address + inst_len)
+                    } else {
+                        int inst_len := 6
+                        if (REX > 0x40 or force_rex) { inst_len += 1 }
+                        if (op_size = 16) { inst_len += 1 }
+                        if (mem_is_imm) { inst_len += imm_size }
+
+                        int64 target_addr := parse_number(inner)
+                        target_addr := target_addr + disp
+                        disp := target_addr - (4194304 + current_address + inst_len)
+                    }
+                }
+            } else {
+                b_id := get_reg_id(inner, registers)
+                if (b_id = -1) {
+                    return "NULL"
+                }
+            }
+
+            if (reg_id >= 8) { REX += 0x04 }
+            if (b_id >= 8 and b_is_rip = false) { REX += 0x01 }
+
+            if (disp_size = 0) {
+                if (b_id = 5 or b_id = 13) {
+                    if (b_is_rip = false) {
+                        disp_size := 1
+                        disp := 0
+                    }
+                }
+            }
+
+            uint64 mod_bits := 0x00
+            if (disp_size = 1) { mod_bits := 0x40 }
+            else if (disp_size = 4) { mod_bits := 0x80 }
+
+            if (b_is_rip) { mod_bits := 0x00 }
+
+            if (b_id = 4 or b_id = 12) and (b_is_rip = false) {
+                modrm := mod_bits | ((reg_id & 7) << 3) | 0x04
+                sib := 0x24
+                if (REX > 0x40 or force_rex) {
+                    if (has_high_byte) { return "NULL" }
+                    out_hex .= dec_to_hex_pair(REX) . " "
+                }
+                if (has_0F) { out_hex .= "0f " }
+                out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(modrm) . " " . dec_to_hex_pair(sib)
+            } else {
+                modrm := mod_bits | ((reg_id & 7) << 3) | (b_id & 7)
+                if (REX > 0x40 or force_rex) {
+                    if (has_high_byte) { return "NULL" }
+                    out_hex .= dec_to_hex_pair(REX) . " "
+                }
+                if (has_0F) { out_hex .= "0f " }
+                out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(modrm)
+            }
+
+            if (disp_size = 1) {
+                out_hex .= " " . dec_to_hex_pair(disp & 0xFF)
+            } else if (disp_size = 4) {
+                out_hex .= " " . dec_to_hex_pair(disp & 0xFF) . " " . dec_to_hex_pair((disp >> 8) & 0xFF) . " " . dec_to_hex_pair((disp >> 16) & 0xFF) . " " . dec_to_hex_pair((disp >> 24) & 0xFF)
+            }
+        }
+
+        if (mem_is_imm) {
+            if (op_size = 8 or opcode = 0x83) {
+                out_hex .= " " . dec_to_hex_pair(imm_val & 0xFF)
+            } else if (op_size = 16) {
+                out_hex .= " " . dec_to_hex_pair(imm_val & 0xFF) . " " . dec_to_hex_pair((imm_val >> 8) & 0xFF)
+            } else {
+                out_hex .= " " . dec_to_hex_pair(imm_val & 0xFF) . " " . dec_to_hex_pair((imm_val >> 8) & 0xFF) . " " . dec_to_hex_pair((imm_val >> 16) & 0xFF) . " " . dec_to_hex_pair((imm_val >> 24) & 0xFF)
+            }
+        }
+    }
+    else if (src_is_imm and is_shift_rotate = false) {
+        int64 imm := 0
+        str trim_src := Trim(src_op)
+        if (RegExMatch(trim_src, "^'.*'$") > 0) {
+            str char1 := StrReplace(trim_src, "'", "")
+            imm := Asc(Trim(char1))
+        } else {
+            imm := parse_number(trim_src)
+        }
+        
+        if (dest_reg_id >= 8) { REX += 0x01 }
+        if (dest_reg_id >= 4 and dest_reg_id <= 7 and op_size = 8 and dest_has_high = false) { force_rex := true }
+
+        if (mnemonic != "mov") {
+            if (imm < -2147483648 or imm > 2147483647) {
+                return "NULL"
+            }
+        }
+
+        bool use_short_form := false
+        if (op_size < 64) {
+            use_short_form := true
+        } else {
+            if (imm < -2147483648 or imm > 2147483647) {
+                use_short_form := true
+            }
+        }
+
+        bool use_83 := false
+        if (mnemonic != "mov" and mnemonic != "test" and mnemonic != "imul" and op_size > 8) {
+            if (imm >= -128 and imm <= 127) {
+                use_83 := true
+            }
+        }
+
+        bool use_rax_shortcut := (dest_reg_id = 0) and (mnemonic != "mov") and (mnemonic != "imul") and (use_83 = false)
+
+        if (use_rax_shortcut) {
+            if (mnemonic = "test") {
+                opcode := (op_size = 8) ? 0xA8 : 0xA9
+            } else {
+                int base_op := get_mnemonic_info(mnemonic, "base_op")
+                opcode := (op_size = 8) ? (base_op + 4) : (base_op + 5)
+            }
+            
+            if (REX > 0x40 or force_rex) {
+                if (has_high_byte) { return "NULL" }
+                out_hex .= dec_to_hex_pair(REX) . " "
+            }
+            out_hex .= dec_to_hex_pair(opcode)
+            
+            if (op_size = 8) { out_hex .= " " . dec_to_hex_pair(imm & 0xFF) }
+            else if (op_size = 16) { out_hex .= " " . dec_to_hex_pair(imm & 0xFF) . " " . dec_to_hex_pair((imm >> 8) & 0xFF) }
+            else { out_hex .= " " . dec_to_hex_pair(imm & 0xFF) . " " . dec_to_hex_pair((imm >> 8) & 0xFF) . " " . dec_to_hex_pair((imm >> 16) & 0xFF) . " " . dec_to_hex_pair((imm >> 24) & 0xFF) }
+        }
+        else if (use_83) {
+            opcode := 0x83
+            modrm := 0xC0 | (get_mnemonic_info(mnemonic, "imm_ext") << 3) | (dest_reg_id & 7)
+            
+            if (REX > 0x40 or force_rex) {
+                if (has_high_byte) { return "NULL" }
+                out_hex .= dec_to_hex_pair(REX) . " "
+            }
+            out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(modrm) . " " . dec_to_hex_pair(imm & 0xFF)
+        }
+        else if (use_short_form and mnemonic = "mov") {
+            if (op_size = 8) {
+                opcode := 0xB0 + (dest_reg_id & 7)
+                if (REX > 0x40 or force_rex) {
+                    if (has_high_byte) { return "NULL" }
+                    out_hex .= dec_to_hex_pair(REX) . " "
+                }
+                out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(imm & 0xFF)
+            } else if (op_size = 16) {
+                opcode := 0xB8 + (dest_reg_id & 7)
+                if (REX > 0x40 or force_rex) {
+                    if (has_high_byte) { return "NULL" }
+                    out_hex .= dec_to_hex_pair(REX) . " "
+                }
+                out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(imm & 0xFF) . " " . dec_to_hex_pair((imm >> 8) & 0xFF)
+            } else if (op_size = 32) {
+                opcode := 0xB8 + (dest_reg_id & 7)
+                if (REX > 0x40 or force_rex) {
+                    if (has_high_byte) { return "NULL" }
+                    out_hex .= dec_to_hex_pair(REX) . " "
+                }
+                out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(imm & 0xFF) . " " . dec_to_hex_pair((imm >> 8) & 0xFF) . " " . dec_to_hex_pair((imm >> 16) & 0xFF) . " " . dec_to_hex_pair((imm >> 24) & 0xFF)
+            } else {
+                opcode := 0xB8 + (dest_reg_id & 7)
+                if (REX > 0x40 or force_rex) {
+                    if (has_high_byte) { return "NULL" }
+                    out_hex .= dec_to_hex_pair(REX) . " "
+                }
+                out_hex .= dec_to_hex_pair(opcode)
+                Loop, 8 {
+                    out_hex .= " " . dec_to_hex_pair((imm >> ((A_Index)*8)) & 0xFF)
+                }
+            }
+        } else {
+            if (mnemonic = "mov") {
+                opcode := 0xC7
+                if (op_size = 8) { opcode := 0xC6 }
+                modrm  := 0xC0 | (dest_reg_id & 7)
+            } else if (mnemonic = "test") {
+                opcode := (op_size = 8) ? 0xF6 : 0xF7
+                modrm  := 0xC0 | (dest_reg_id & 7)
+            } else if (mnemonic = "imul") {
+                bool imm_fits_8 := (imm >= -128 and imm <= 127)
+                opcode := imm_fits_8 ? 0x6B : 0x69
+                modrm := 0xC0 | ((dest_reg_id & 7) << 3) | (dest_reg_id & 7)
+            } else {
+                opcode := (op_size = 8) ? 0x80 : 0x81
+                modrm  := 0xC0 | (get_mnemonic_info(mnemonic, "imm_ext") << 3) | (dest_reg_id & 7)
+            }
+            
+            if (REX > 0x40 or force_rex) {
+                if (has_high_byte) { return "NULL" }
+                out_hex .= dec_to_hex_pair(REX) . " "
+            }
+            out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(modrm)
+            
+            if (op_size = 8 or opcode = 0x6B) {
+                out_hex .= " " . dec_to_hex_pair(imm & 0xFF)
+            } else if (op_size = 16) {
+                out_hex .= " " . dec_to_hex_pair(imm & 0xFF) . " " . dec_to_hex_pair((imm >> 8) & 0xFF)
+            } else {
+                out_hex .= " " . dec_to_hex_pair(imm & 0xFF) . " " . dec_to_hex_pair((imm >> 8) & 0xFF) . " " . dec_to_hex_pair((imm >> 16) & 0xFF) . " " . dec_to_hex_pair((imm >> 24) & 0xFF)
+            }
+        }
+    }
+    else {
+        if (dest_reg_id = -1) {
+            return "NULL"
+        }
+
+        if (mnemonic = "push" or mnemonic = "pop") {
+            if (op_size = 8 or op_size = 32) {
+                return "NULL"
+            }
+            str prefix := ""
+            if (op_size = 16) {
+                prefix := "66 "
+            }
+            if (dest_reg_id >= 8) {
+                prefix .= "41 "
+            }
+            int base := (mnemonic = "push") ? 0x50 : 0x58
+            out_hex := prefix . dec_to_hex_pair(base + (dest_reg_id & 7))
+            return out_hex
+        }
+
+        if (is_shift_rotate) {
+            if (src_op = "1") {
+                opcode := (op_size = 8) ? 0xD0 : 0xD1
+            } else if (src_op = "cl") {
+                opcode := (op_size = 8) ? 0xD2 : 0xD3
+            } else if (src_is_imm) {
+                opcode := (op_size = 8) ? 0xC0 : 0xC1
+                imm_val := parse_number(src_op)
+            } else {
+                return "NULL"
+            }
+            
+            if (dest_reg_id >= 8) { REX += 0x01 }
+            modrm := 0xC0 | (ext << 3) | (dest_reg_id & 7)
+            
+            if (dest_reg_sz = 8 and dest_reg_id >= 4 and dest_reg_id <= 7 and dest_has_high = false) { force_rex := true }
+            
+            if (REX > 0x40 or force_rex) {
+                if (has_high_byte) { return "NULL" }
+                out_hex .= dec_to_hex_pair(REX) . " "
+            }
+            out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(modrm)
+            if (src_is_imm and src_op != "1") {
+                out_hex .= " " . dec_to_hex_pair(imm_val & 0xFF)
+            }
+            return out_hex
+        }
+
+        if (src_op = "") {
+            int ext_single := 0
+            if (mnemonic = "inc") { ext_single := 0 }
+            else if (mnemonic = "dec") { ext_single := 1 }
+            else if (mnemonic = "call") { ext_single := 2 }
+            else if (mnemonic = "not") { ext_single := 2 }
+            else if (mnemonic = "neg") { ext_single := 3 }
+            else if (mnemonic = "jmp") { ext_single := 4 }
+            else if (mnemonic = "mul") { ext_single := 4 }
+            else if (mnemonic = "imul") { ext_single := 5 }
+            else if (mnemonic = "div") { ext_single := 6 }
+            else if (mnemonic = "idiv") { ext_single := 7 }
+            
+            if (dest_reg_id >= 8) { REX += 0x01 }
+            
+            bool is_group3 := (mnemonic = "not" or mnemonic = "neg" or mnemonic = "mul" or mnemonic = "imul" or mnemonic = "div" or mnemonic = "idiv")
+            if (mnemonic = "call" or mnemonic = "jmp") {
+                opcode := 0xFF
+            } else if (is_group3) {
+                opcode := (op_size = 8) ? 0xF6 : 0xF7
+            } else {
+                opcode := (op_size = 8) ? 0xFE : 0xFF
+            }
+            
+            modrm := 0xC0 | (ext_single << 3) | (dest_reg_id & 7)
+            
+            if (dest_reg_sz = 8 and dest_reg_id >= 4 and dest_reg_id <= 7 and dest_has_high = false) { force_rex := true }
+            
+            if (REX > 0x40 or force_rex) {
+                if (has_high_byte) { return "NULL" }
+                out_hex .= dec_to_hex_pair(REX) . " "
+            }
+            out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(modrm)
+            return out_hex
+        }
+
+        bool is_ext_instr := (mnemonic = "movzx" or mnemonic = "movsx" or mnemonic = "movsxd" or mnemonic = "imul")
+        
+        if (is_ext_instr) {
+            if (dest_reg_id >= 8) { REX += 0x04 } 
+            if (src_reg_id >= 8)  { REX += 0x01 } 
+        } else {
+            if (dest_reg_id >= 8) { REX += 0x01 } 
+            if (src_reg_id >= 8)  { REX += 0x04 } 
+        }
+        
+        if (op_size = 8) {
+            if (dest_reg_id >= 4 and dest_reg_id <= 7 and dest_has_high = false) { force_rex := true }
+            if (src_reg_id >= 4 and src_reg_id <= 7 and src_has_high = false) { force_rex := true }
+        }
+        
+        if (mnemonic = "mov") {
+            opcode := (op_size = 8) ? 0x88 : 0x89
+        } else if (mnemonic = "movzx") {
+            has_0F := true
+            opcode := (src_reg_sz = 8) ? 0xB6 : 0xB7
+        } else if (mnemonic = "movsx") {
+            has_0F := true
+            opcode := (src_reg_sz = 8) ? 0xBE : 0xBF
+        } else if (mnemonic = "movsxd") {
+            opcode := 0x63
+        } else if (mnemonic = "test") {
+            opcode := (op_size = 8) ? 0x84 : 0x85
+        } else if (is_imul_3_op) {
+            if (op_size = 8) { return "NULL" }
+            int64 imul_imm_temp := parse_number(imul_imm_str)
+            bool imm_fits_8 := (imul_imm_temp >= -128 and imul_imm_temp <= 127)
+            opcode := imm_fits_8 ? 0x6B : 0x69
+        } else if (mnemonic = "imul") {
+            if (op_size = 8) { return "NULL" }
+            has_0F := true
+            opcode := 0xAF
+        } else {
+            int base_op := get_mnemonic_info(mnemonic, "base_op")
+            opcode := (op_size = 8) ? (base_op + 2) : (base_op + 3)
+        }
+        
+        is_ext_instr := (mnemonic = "movzx" or mnemonic = "movsx" or mnemonic = "movsxd" or mnemonic = "imul")
+        bool uses_reg_rm_style := (is_ext_instr or (mnemonic != "mov"))
+        
+        if (uses_reg_rm_style) {
+            modrm := 0xC0 | ((dest_reg_id & 7) << 3) | (src_reg_id & 7)
+        } else {
+            modrm := 0xC0 | ((src_reg_id & 7) << 3) | (dest_reg_id & 7)
+        }
+        
+        if (REX > 0x40 or force_rex) {
+            if (has_high_byte) { return "NULL" }
+            out_hex .= dec_to_hex_pair(REX) . " "
+        }
+        if (has_0F) { out_hex .= "0f " }
+        out_hex .= dec_to_hex_pair(opcode) . " " . dec_to_hex_pair(modrm)
+    }
+
+    if (is_imul_3_op) {
+        int64 imul_imm := parse_number(imul_imm_str)
+        bool imm_fits_8 := (imul_imm >= -128 and imul_imm <= 127)
+        if (imm_fits_8) {
+            out_hex .= " " . dec_to_hex_pair(imul_imm & 0xFF)
+        } else {
+            if (op_size = 16) {
+                out_hex .= " " . dec_to_hex_pair(imul_imm & 0xFF) . " " . dec_to_hex_pair((imul_imm >> 8) & 0xFF)
+            } else {
+                out_hex .= " " . dec_to_hex_pair(imul_imm & 0xFF) . " " . dec_to_hex_pair((imul_imm >> 8) & 0xFF) . " " . dec_to_hex_pair((imul_imm >> 16) & 0xFF) . " " . dec_to_hex_pair((imul_imm >> 24) & 0xFF)
+            }
+        }
+    }
+
+    return out_hex
+}
+
+
+
+
+
+
+
+
+
+str str0 := ""
+str str1 := ""
+str str2 := ""
+str str3 := ""
+str str4 := ""
+str str5 := ""
+str str6 := ""
+str str7 := ""
+str str8 := ""
+str str9 := ""
+str str10 := ""
+str str11 := ""
+str str12 := ""
+str str13 := ""
+str str14 := ""
+str str15 := ""
+str str16 := ""
+str str17 := ""
+str str18 := ""
+str str19 := ""
+str str20 := ""
+
+; tundra GLOBALS
+; tundra GLOBALS
+
+arr str tokens
+arr str locations
+arr str file_name
+
+arr str strings
+int strings_count := 0
+str keyWordEscape := Chr(96)
+arr str prog_blocks
+int prog_blocks_count := 0
+arr str arradds
+int arradds_count := 0
+
+; tundra GLOBALS
+; tundra GLOBALS
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; need for handle_include
+str main_file_name := ""
+int doseHaveInclude_int := 0
+; need for handle_include
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; 
+
+
+; TUNDRA PARSER AND TOKENIZER
+; TUNDRA PARSER AND TOKENIZER
+; TUNDRA PARSER AND TOKENIZER
+
+
+
+func str remove_comments(str code, str sl_mark, str ml_start, str ml_end, str escape_char) {
+    
+    str new_code := ""
+    int code_len := 0
+    int i_pos := 0
+    str c := ""
+    int skip := 0
+    bool in_str := false
+    bool in_slc := false
+    bool in_mlc := false
+    bool is_escaped := false
+    int sl_len := 0
+    int mls_len := 0
+    int mle_len := 0
+    str p_char := ""
+    bool can_start_comment := false
+
+    code_len := StrLen(code)
+    sl_len := StrLen(sl_mark)
+    mls_len := StrLen(ml_start)
+    mle_len := StrLen(ml_end)
+
+    Loop, code_len {
+        if (skip > 0) {
+            skip--
+            continue
+        }
+
+        i_pos := A_Index + 1
+        c := SubStr(code, i_pos, 1)
+
+        if (c = Chr(10)) {
+            in_slc := false
+            is_escaped := false
+            new_code .= c
+            continue
+        }
+
+        if (in_slc = true) {
+            continue
+        }
+
+        if (in_mlc = true) {
+            if (mle_len > 0) {
+                if (SubStr(code, i_pos, mle_len) = ml_end) {
+                    in_mlc := false
+                    skip := mle_len - 1
+                }
+            }
+            continue
+        }
+
+        if (is_escaped = true) {
+            is_escaped := false
+            new_code .= c
+            continue
+        }
+
+        if (in_str = true) {
+            if (c = escape_char) {
+                is_escaped := true
+            } else if (c = Chr(34)) {
+                in_str := false
+            }
+            new_code .= c
+            continue
+        }
+
+        if (c = Chr(34)) {
+            in_str := true
+            new_code .= c
+            continue
+        }
+
+        ; --- THE FIX: Only start SL comment if preceded by whitespace or Start-of-Line ---
+        if (sl_len > 0) {
+            if (SubStr(code, i_pos, sl_len) = sl_mark) {
+                can_start_comment := false
+                if (i_pos = 1) {
+                    can_start_comment := true
+                } else {
+                    p_char := SubStr(code, i_pos - 1, 1)
+                    if (p_char = " ") or (p_char = Chr(9)) or (p_char = Chr(10)) or (p_char = Chr(13)) {
+                        can_start_comment := true
+                    }
+                }
+
+                if (can_start_comment = true) {
+                    in_slc := true
+                    skip := sl_len - 1
+                    continue
+                }
+            }
+        }
+
+        if (mls_len > 0) {
+            if (SubStr(code, i_pos, mls_len) = ml_start) {
+                in_mlc := true
+                skip := mls_len - 1
+                continue
+            }
+        }
+
+        new_code .= c
+    }
+    return new_code
+}
+
+func str restoreStrings_tundra(str code) {
+Loop, strings_count {
+
+code := StrReplace(code, "vsiauydvgbausvbausodyfhidoufcgsiyouysfivgidfvasdkubfcasAA" . STR(A_Index + 1) . "AA", strings[A_Index])
+}
+
+return code
+}
+
+func bool tokenize_first_help(str c1, str c2) {
+    if (RegExMatch(c1, "^\w$")) and (RegExMatch(c2, "^\w$")) {
+        return false
+    }
+    return true
+}
+
+func void tokenize_first(str code) {
+
+    arr str future
+    str hold_temp := ""
+    str hold_temp_strings := ""
+    int inChr34 := 0
+    int wasChr34 := 0
+    int countNewLines := 0
+    int countChars_num_on_same_line := 1
+    bool is_escaped := false
+    
+    Loop, Parse, code {
+        future.add(A_LoopField)
+    }
+    future.add(" ")
+    
+    Loop, Parse, code {
+        if (A_LoopField = Chr(10)) {
+            countNewLines++
+            countChars_num_on_same_line := 0
+        }
+        else {
+            countChars_num_on_same_line++
+        }
+        
+        hold_temp .= A_LoopField
+        if (tokenize_first_help(A_LoopField, future[A_Index + 1])) {
+
+
+            if (is_escaped = true) {
+                is_escaped := false
+            } else if (A_LoopField = keyWordEscape) {
+
+                is_escaped := true
+            } else if (A_LoopField = Chr(34)) {
+
+                inChr34++
+                wasChr34 := 1
+            }
+                
+            if (inChr34 = 2) {
+                hold_temp_strings .= hold_temp
+                inChr34 := 0
+                wasChr34 := 0
+                strings_count++
+                strings.add(hold_temp_strings)
+                tokens.add("vsiauydvgbausvbausodyfhidoufcgsiyouysfivgidfvasdkubfcasAA" . STR(strings_count) . "AA")
+                hold_temp_strings := ""
+                locations.add(STR(countNewLines + 1) . ":" . STR(countChars_num_on_same_line))
+            }
+            else {
+                if (wasChr34 = 0) {
+                    if (Trim(hold_temp) != "") {
+                        tokens.add(hold_temp)
+                        locations.add(STR(countNewLines + 1) . ":" . STR(countChars_num_on_same_line))
+                    }
+                }
+                else {
+                    hold_temp_strings .= hold_temp
+                }
+            }
+            
+            hold_temp := ""
+        }
+    }
+}
+
+
+
+func void tokenize_add_semicolons() {
+
+    arr str new_tokens
+    arr str new_locations
+    int paren_depth := 0
+    int bracket_depth := 0
+    bool should_insert_semicolon := false
+    str current_token := ""
+    str next_token := ""
+    str current_location := ""
+    str next_location := ""
+    str current_line_num := ""
+    str next_line_num := ""
+    bool is_on_new_line := false
+    int loop_iterations := 0
+    int original_tokens_initial_size := 0
+    int new_tokens_final_size := 0
+    int next_idx := 0
+    int nt_size := 0
+    int last_idx := 0
+    bool is_paren_brace_combo := false
+
+    loop_iterations := tokens.size()
+
+    Loop, loop_iterations {
+        current_token := tokens[A_Index]
+        current_location := locations[A_Index]
+
+        next_idx := A_Index + 1
+        if (next_idx < loop_iterations) {
+            next_token := tokens[next_idx]
+            next_location := locations[next_idx]
+        } else {
+            next_token := "SENTINEL_END_OF_INPUT"
+            next_location := current_location
+        }
+
+        new_tokens.add(current_token)
+        new_locations.add(current_location)
+
+        if (current_token = "(") {
+            paren_depth++
+        } else if (current_token = ")") {
+            paren_depth--
+        } else if (current_token = "[") {
+            bracket_depth++
+        } else if (current_token = "]") {
+            bracket_depth--
+        }
+
+        should_insert_semicolon := false
+        is_on_new_line := false
+        is_paren_brace_combo := false
+        
+        if (next_token != "SENTINEL_END_OF_INPUT") {
+            current_line_num := StrSplit(current_location, ":", 1)
+            next_line_num := StrSplit(next_location, ":", 1)
+            if (current_line_num != next_line_num) {
+                is_on_new_line := true
+            }
+        }
+
+        if (current_token = ")") and (next_token = "{") {
+            is_paren_brace_combo := true
+        }
+
+        if (paren_depth = 0) and (bracket_depth = 0) {
+            if (current_token != ";") and (current_token != "{") and (current_token != "}") {
+                if (is_on_new_line = true) {
+                    if (current_token != "else") and (is_paren_brace_combo = false) and (next_token != "{") and (next_token != "else") and (next_token != "SENTINEL_END_OF_INPUT") {
+                        should_insert_semicolon := true
+                    }
+                }
+            }
+            
+            if (next_token = "}") and (is_on_new_line = true) and (current_token != "{") and (current_token != ";") {
+                should_insert_semicolon := true
+            }
+        }
+        
+        if (should_insert_semicolon = true) {
+            nt_size := new_tokens.size()
+            if (nt_size > 0) {
+                last_idx := nt_size - 1
+                if (new_tokens[last_idx] = ";") {
+                    should_insert_semicolon := false
+                }
+            }
+        }
+
+        if (should_insert_semicolon = true) {
+            new_tokens.add(";")
+            new_locations.add(current_location)
+        }
+    }
+
+    original_tokens_initial_size := tokens.size()
+    Loop, original_tokens_initial_size {
+        tokens.pop()
+        locations.pop()
+    }
+
+    new_tokens_final_size := new_tokens.size()
+    Loop, new_tokens_final_size {
+        tokens.add(new_tokens[A_Index])
+        locations.add(new_locations[A_Index])
+    }
+
+    tokens.add(" ")
+    tokens.add(" ")
+}
+
+func str getLastWordFromToken(str token) {
+    str out := ""
+
+    if (Trim(token) = "") {
+        return Trim(token)
+    }
+
+    Loop, Parse, token, " " {
+        out := Trim(A_LoopField)
+    }
+    return out
+}
+
+func str mask_arradd(str code) {
+
+
+    str new_code := ""
+    int code_len := 0
+    int i := 1
+    str c := ""
+    int skip := 0
+    int start_pos := 0
+    str block_content := ""
+    str rest_of_code := ""
+    int found_in_rest := 0
+    bool in_str := false
+    bool is_escaped := false
+    bool can_start := false
+    str p_char := ""
+
+    code_len := StrLen(code)
+
+    Loop, code_len {
+        if (skip > 0) {
+            skip--
+            continue
+        }
+
+        i := A_Index + 1
+        c := SubStr(code, i, 1)
+
+        ; --- String Protection ---
+        if (is_escaped = true) {
+            is_escaped := false
+            new_code .= c
+            continue
+        }
+        if (in_str = true) {
+            if (c = keyWordEscape) {
+                is_escaped := true
+            } else if (c = Chr(34)) {
+                in_str := false
+            }
+            new_code .= c
+            continue
+        }
+        if (c = Chr(34)) {
+            in_str := true
+            new_code .= c
+            continue
+        }
+
+        ; --- Detect arradd ---
+        if (StrLower(c) = "a") {
+            ; Check if it is "arradd" followed by a space or a tab
+            if (StrLower(SubStr(code, i, 7)) = "arradd ") or (StrLower(SubStr(code, i, 7)) = "arradd" . Chr(9)) {
+                
+                ; Only trigger if it is at the start of a line or separated by whitespace
+                can_start := false
+                if (i = 1) {
+                    can_start := true
+                } else {
+                    p_char := SubStr(code, i - 1, 1)
+                    if (p_char = " ") or (p_char = Chr(9)) or (p_char = Chr(10)) or (p_char = Chr(13)) {
+                        can_start := true
+                    }
+                }
+
+                if (can_start = true) {
+                    start_pos := i
+                    
+                    ; Look ahead for the line break
+                    rest_of_code := SubStr(code, start_pos)
+                    found_in_rest := InStr(rest_of_code, Chr(10))
+                    
+                    if (found_in_rest > 0) {
+                        ; Grab everything up to the newline, but DO NOT include the Chr(10)
+                        block_content := SubStr(code, start_pos, found_in_rest - 1)
+                    } else {
+                        ; If there is no newline, it goes to the end of the file
+                        block_content := rest_of_code
+                    }
+                    
+                    ; Strip trailing carriage return Chr(13) if Windows-style line endings \r\n
+                    if (SubStr(block_content, StrLen(block_content), 1) = Chr(13)) {
+                        block_content := SubStr(block_content, 1, StrLen(block_content) - 1)
+                    }
+                    
+                    arradds_count++
+                    arradds.add(block_content)
+                    
+                    ; Swap out with a unique token that passes the tokenizers "^\w+$" regex
+                    new_code .= "vgdskjbhfgkjbfsgkjbdfsgjksdfgARRADD" . STR(arradds_count) . "AA"
+                    
+                    skip := StrLen(block_content) - 1
+                    continue
+                }
+            }
+        }
+
+        new_code .= c
+    }
+    return new_code
+}
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; main Tundra()
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+func str Tundra_for_asm(str code) {
+
+tokens := []
+locations := []
+strings := []
+strings_count := 0
+keyWordEscape := Chr(96)
+prog_blocks := []
+prog_blocks_count := 0
+arradds := []
+arradds_count := 0
+
+
+
+str token := ""
+str code_original := ""
+str out := ""
+int skip := 0
+
+code_original := code
+
+
+
+
+
+code := remove_comments(code, ";", "'''1", "'''2", keyWordEscape)
+code := mask_arradd(code)
+tokenize_first(code)
+tokenize_add_semicolons()
+
+
+;Loop, tokens.size() - 2 {
+;    print("element" . STR(A_Index + 1) . ": " . tokens[A_Index] . "      Location: " . locations[A_Index])
+;}
+;print("===============================")
+;Loop, strings_count {
+;print(strings[A_Index])
+;}
+
+    arr str object_names
+    int max_tokens := tokens.size()
+    str t_low := ""
+    int next1 := 0
+    int next2 := 0
+    int next3 := 0
+    str as_kw := ""
+
+    Loop, max_tokens {
+        t_low := StrLower(tokens[A_Index])
+        
+
+        if (t_low = "alliance") or (t_low = "crew") or (t_low = "struct") {
+            next1 := A_Index + 1
+            if (next1 < max_tokens) {
+                object_names.add(tokens[next1])
+            }
+        }
+
+
+        else if (t_low = "instance") {
+            next2 := A_Index + 2
+            next3 := A_Index + 3
+            if (next3 < max_tokens) {
+                as_kw := StrLower(tokens[next2])
+                if (as_kw = "as") {
+                    object_names.add(tokens[next3])
+                }
+            }
+        }
+    }
+    
+    tokens.add(" ")
+    tokens.add(" ")
+
+    token := ""
+    str next_token := ""
+    str next_location := ""
+    str current_location := "" 
+    int next_idx := 0
+    str next2_token := ""
+    int next2_idx := 0
+    str next3_token := ""
+    int next3_idx := 0
+    str prev_token := ""
+    bool add_space := true
+    bool c_is_word := false
+    bool n_is_word := false
+    bool curr_is_obj := false
+    bool prev_is_obj := false
+    
+                    str l1_line := ""
+                int l1_col := 0
+                
+                str l2_line := ""
+                int l2_col := 0
+                
+                    int expected_col := 0
+    
+
+    Loop, tokens.size() - 4 {
+        if (skip > 0) {
+            skip--
+            continue
+        }
+
+        token := tokens[A_Index]
+        current_location := locations[A_Index]
+        
+        next_token := ""
+        next2_token := ""
+        next3_token := ""
+        prev_token := ""
+        add_space := true
+        c_is_word := false
+        n_is_word := false
+        curr_is_obj := false
+        prev_is_obj := false
+        next_location := ""  
+
+        next_idx := A_Index + 1
+        if (next_idx < tokens.size()) { 
+            next_token := tokens[next_idx]
+        }
+        
+        ; PROTECT LOCATIONS ARRAY FROM OUT-OF-BOUNDS CRASH
+        if (next_idx < locations.size()) {
+            next_location := locations[next_idx]
+        } else {
+            next_location := ""
+        }
+
+        next2_idx := A_Index + 2
+        if (next2_idx < tokens.size()) { next2_token := tokens[next2_idx] }
+
+        next3_idx := A_Index + 3
+        if (next3_idx < tokens.size()) { next3_token := tokens[next3_idx] }
+
+
+        if (A_Index > 1) { prev_token := tokens[A_Index - 1] }
+
+        Loop, object_names.size() {
+            if (token = object_names[A_Index]) {
+                curr_is_obj := true
+            }
+            if (prev_token = object_names[A_Index]) {
+                prev_is_obj := true
+            }
+        }
+
+        if (token = ";") {
+            out .= Chr(10)
+        }
+        else if (token = "{") {
+            out .= Chr(10) . "{" . Chr(10)
+        }
+        else if (token = "}") {
+            out .= Chr(10) . "}" . Chr(10)
+        }
+        else {
+            if (RegExMatch(token, "^\w+$") > 0) { c_is_word := true }
+            if (RegExMatch(next_token, "^\w+$") > 0) { n_is_word := true }
+
+            if (next_token = "(") or (next_token = ")") or (next_token = "]") {
+                add_space := false
+            }
+            else if (next_token = "[") {
+                if (c_is_word = true) {
+                    add_space := false
+                } else {
+                    add_space := true
+                }
+            }
+            else if (token = "(") or (token = "[") {
+                add_space := false
+            }
+            else if (next_token = ",") {
+                add_space := false
+            }
+            else if (c_is_word = false) and (n_is_word = false) {
+                add_space := false
+            }
+
+
+            if (next_token = "=") {
+                add_space := true
+            }
+            if (token = "=") {
+                add_space := true
+            }
+
+
+
+            if (token = keyWordEscape) {
+                add_space := false
+            }
+            
+            if (token = "!") or (next_token = ":") {
+                add_space := false
+            }
+            
+            if (token = ".") or (next_token = ".") {
+                add_space := false
+            }
+
+            if (next_token = "-") or (next_token = "[") {
+                add_space := true
+            }
+
+
+
+            if (token = "-") {
+                l1_line := StrSplit(current_location, ":", 1)
+                l1_col := INT(StrSplit(current_location, ":", 2))
+                
+                l2_line := StrSplit(next_location, ":", 1)
+                l2_col := INT(StrSplit(next_location, ":", 2))
+                
+                if (l1_line = l2_line) {
+
+                    expected_col := l1_col + StrLen(next_token)
+                    if (expected_col = l2_col) {
+                        add_space := false
+                    } else {
+                        add_space := true
+                    }
+                } else {
+                    add_space := true
+                }
+            }
+
+            if (token = "&") or (token = "|") {
+                if (next_token = "(") {
+                    add_space := true
+                }
+            }
+
+            if (token = "$") {
+                add_space := false
+            }
+
+            if (token = ",") {
+                add_space := true
+            }
+
+            if (token = ")") or (token = "]") {
+                add_space := true
+                if (next_token = ")") or (next_token = "]") or (next_token = ",") or (next_token = ";") or (next_token = ".") or (next_token = ":") {
+                    add_space := false
+                }
+            }
+
+            if (add_space = true) {
+                out .= token . " "
+            } else {
+                out .= token
+            }
+        }
+    }
+
+str out2 := ""
+Loop, Parse, out, `n, `r {
+    str line := A_LoopField
+    str trimmed := Trim(line)
+    
+    if (SubStr(trimmed, 1, 4) = "jmp.") {
+        line := StrReplace(line, "jmp.", "jmp .")  ; replace first occurrence only
+    }
+    else if (SubStr(trimmed, 1, 3) = "je.") {
+        line := StrReplace(line, "je.", "je .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jne.") {
+        line := StrReplace(line, "jne.", "jne .")
+    }
+    else if (SubStr(trimmed, 1, 3) = "jl.") {
+        line := StrReplace(line, "jl.", "jl .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jle.") {
+        line := StrReplace(line, "jle.", "jle .")
+    }
+    else if (SubStr(trimmed, 1, 3) = "jg.") {
+        line := StrReplace(line, "jg.", "jg .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jge.") {
+        line := StrReplace(line, "jge.", "jge .")
+    }
+    else if (SubStr(trimmed, 1, 3) = "ja.") {
+        line := StrReplace(line, "ja.", "ja .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jae.") {
+        line := StrReplace(line, "jae.", "jae .")
+    }
+    else if (SubStr(trimmed, 1, 3) = "jb.") {
+        line := StrReplace(line, "jb.", "jb .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jbe.") {
+        line := StrReplace(line, "jbe.", "jbe .")
+    }
+    else if (SubStr(trimmed, 1, 3) = "jc.") {
+        line := StrReplace(line, "jc.", "jc .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jnc.") {
+        line := StrReplace(line, "jnc.", "jnc .")
+    }
+    else if (SubStr(trimmed, 1, 3) = "jo.") {
+        line := StrReplace(line, "jo.", "jo .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jno.") {
+        line := StrReplace(line, "jno.", "jno .")
+    }
+    else if (SubStr(trimmed, 1, 3) = "js.") {
+        line := StrReplace(line, "js.", "js .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jns.") {
+        line := StrReplace(line, "jns.", "jns .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jpe.") {
+        line := StrReplace(line, "jpe.", "jpe .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jpo.") {
+        line := StrReplace(line, "jpo.", "jpo .")
+    }
+    else if (SubStr(trimmed, 1, 3) = "jz.") {
+        line := StrReplace(line, "jz.", "jz .")
+    }
+    else if (SubStr(trimmed, 1, 4) = "jnz.") {
+        line := StrReplace(line, "jnz.", "jnz .")
+    }
+    
+    out2 .= line . Chr(10)
+}
+
+StringTrimRight, out, out2, 1  ; remove last newline
+out := StrReplace(out, "''", "32")
+
+;out := indent_nested_curly_braces(out)
+out := restoreStrings_tundra(out)
+;print("================== OUT ==================")
+;print("================== OUT ==================")
+;print("================== OUT ==================")
+;print(out)
+return out
+}
+
+
+; TUNDRA PARSER AND TOKENIZER
+; TUNDRA PARSER AND TOKENIZER
+; TUNDRA PARSER AND TOKENIZER
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+
+
+str error_line := ""
+
+func int assembler(str code, str file_name) {
+
+
+    arr str allData
+    arr str header
+
+    str start1 := "00" ; Will be updated dynamically
+    str start2 := "00" 
+    str start3 := "00" 
+    str start4 := "00" 
+
+    code := Tundra_for_asm(code)
+    ;print("========== in assembler ==========")
+    HT_LIB_theIdNumOfThe34 := 0
+    HT_Lib_theIdNumOfThe34theVar := []
+    ; The ultimate 2-segment, 174-byte header template
+    ; PHDR 1: Maps the ENTIRE file (Data + Code) at 0x400000
+    ; PHDR 2: Maps the BSS variables at 0x10000000
+    header := ["7f", "45", "4c", "46", "02", "01", "01", "03", "00", "00", "00", "00", "00", "00", "00", "00", "02", "00", "3e", "00", "01", "00", "00", "00", start1, start2, start3, start4, "00", "00", "00", "00", "40", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "40", "00", "38", "00", "02", "00", "40", "00", "00", "00", "00", "00", "01", "00", "00", "00", "07", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "40", "00", "00", "00", "00", "00", "00", "00", "40", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "10", "00", "00", "00", "00", "00", "00", "01", "00", "00", "00", "06", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "10", "00", "00", "00", "00", "00", "00", "00", "10", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "00", "10", "00", "00", "00", "00"]
+
+    str temp_encode_out := ""
+    str save_start_temp := ""
+    
+    arr str str_names
+    arr int str_size
+    arr str str_size_name
+    arr str str_name_size_num
+    arr str str_names_arrd
+    uint64 mock_address_str := 0
+
+    int str_names_size := 0
+    
+    arr str equ_names
+    arr str equ_values
+
+    ; Your exact original BSS logic
+    uint64 current_bss_addr := 268435456
+    int total_bss_size := 0
+
+    str keyWordEscpaeChar := Chr(92)
+    code := preserveStrings(code)
+    str code_out := ""
+
+    Loop, Parse, code, `n, `r {
+        str trimmed_line := Trim(A_LoopField)
+
+        if (InStr(trimmed_line, "format ") = 1) or (InStr(trimmed_line, "entry ") = 1) or (InStr(trimmed_line, "segment ") = 1) {
+            continue
+        }
+
+if (InStr(A_LoopField, " db ")) {
+            str_names_size := 0
+            str1 := Trim(StrSplit(A_LoopField, " db ", 1))
+            str2 := Trim(StrSplit(A_LoopField, " db ", 2))
+            str3 := Trim(StrSplit(str2, ",", 1))
+            str4 := Trim(StrSplit(str2, ",", 2))
+
+            Loop, % HT_LIB_theIdNumOfThe34 {
+                if (HT_LIB_theIdNumOfThe34 = A_Index + 1) {
+                    str3 := StrReplace(str3, "VYIGUOYIYVIUCFCYIUCFCYIGCYGICFHYFHCTCFTFDFGYGFC" . Chr(65) . Chr(65) . STR(A_Index + 1) . Chr(65) . Chr(65), StrReplace(HT_Lib_theIdNumOfThe34theVar[A_Index + 1], keyWordEscpaeChar, "\") . Chr(34))
+                } else {
+                    str3 := StrReplace(str3, "VYIGUOYIYVIUCFCYIUCFCYIGCYGICFHYFHCTCFTFDFGYGFC" . Chr(65) . Chr(65) . STR(A_Index + 1) . Chr(65) . Chr(65), StrReplace(HT_Lib_theIdNumOfThe34theVar[A_Index + 1], keyWordEscpaeChar, "\"))
+                }
+            }
+            
+            bool is_string := false
+            if (SubStr(str3, 1, 1) = Chr(34) or SubStr(str3, 1, 1) = "'") {
+                is_string := true
+                str3 := StringTrimLeft(str3, 1)
+                str3 := StringTrimRight(str3, 1)
+            }
+
+            mock_address_str := header.size()
+            save_start_temp := address_to_hexstr(4194304 + mock_address_str)
+
+            str_names.add(str1)
+            str_names_arrd.add(save_start_temp)
+
+            if (Trim(str4) = "") {
+                if (str3 != "") {
+                    if (is_string = false) {
+                        header.add(dec_to_hex_pair(parse_number(str3)))
+                        str_names_size++
+                    } else {
+                        Loop, Parse, str3 {
+                            header.add(char_to_hex(A_LoopField))
+                            str_names_size++
+                        }
+                    }
+                }
+            } else {
+                if (str3 = "") {
+                    header.add(char_to_hex(Chr(parse_number(str4))))
+                    str_names_size++
+                } else {
+                    if (is_string = false) {
+                        header.add(dec_to_hex_pair(parse_number(str3)))
+                        str_names_size++
+                    } else {
+                        Loop, Parse, str3 {
+                            header.add(char_to_hex(A_LoopField))
+                            str_names_size++
+                        }
+                    }
+                    header.add(char_to_hex(Chr(parse_number(str4))))
+                    str_names_size++
+                }
+            }
+
+            str_size.add(str_names_size)
+        }
+        else if (InStr(A_LoopField, " dq ")) {
+            str1 := Trim(StrSplit(A_LoopField, " dq ", 1)) 
+            str2 := Trim(StrSplit(A_LoopField, " dq ", 2)) 
+            
+            mock_address_str := header.size()
+            save_start_temp := address_to_hexstr(4194304 + mock_address_str)
+            
+            str_names.add(str1)
+            str_names_arrd.add(save_start_temp)
+            
+            str dq_hex := size_to_hex64(parse_number(str2))
+            Loop, Parse, dq_hex, " " {
+                header.add(A_LoopField)
+            }
+            
+
+            str_size.add(8)
+        }
+        else if (InStr(A_LoopField, " rb ")) {
+            str1 := Trim(StrSplit(A_LoopField, " rb ", 1)) 
+            str2 := Trim(StrSplit(A_LoopField, " rb ", 2)) 
+            
+            str_names.add(str1)
+            str_names_arrd.add(address_to_hexstr(current_bss_addr))
+            ; FIXED: Keep the str_size array synchronized
+            str_size.add(INT(str2))
+            current_bss_addr := current_bss_addr + INT(str2)
+            total_bss_size := total_bss_size + INT(str2)
+        }
+        else if (InStr(A_LoopField, " rq ")) {
+            str1 := Trim(StrSplit(A_LoopField, " rq ", 1)) 
+            str2 := Trim(StrSplit(A_LoopField, " rq ", 2)) 
+            
+            str_names.add(str1)
+            str_names_arrd.add(address_to_hexstr(current_bss_addr))
+            
+            int reserved_bytes := INT(str2) * 8
+            ; FIXED: Keep the str_size array synchronized
+            str_size.add(reserved_bytes)
+            current_bss_addr := current_bss_addr + reserved_bytes
+            total_bss_size := total_bss_size + reserved_bytes
+        }
+        else if (InStr(A_LoopField, "=") and InStr(A_LoopField, "$-") = 0) {
+            str1 := Trim(StrSplit(A_LoopField, "=", 1))
+            str2 := Trim(StrSplit(A_LoopField, "=", 2))
+            equ_names.add(str1)
+            equ_values.add(str2)
+        }
+        else if (InStr(A_LoopField, " = $-")) or (InStr(A_LoopField, "= $-")) or (InStr(A_LoopField, " =$-")) or (InStr(A_LoopField, "=$-")) {
+            if (InStr(A_LoopField, " = $-")) {
+                str1 := Trim(StrSplit(A_LoopField, " = $-", 1))
+                str2 := Trim(StrSplit(A_LoopField, " = $-", 2))
+            } else if (InStr(A_LoopField, "= $-")) {
+                str1 := Trim(StrSplit(A_LoopField, "= $-", 1))
+                str2 := Trim(StrSplit(A_LoopField, "= $-", 2))
+            } else if (InStr(A_LoopField, " =$-")) {
+                str1 := Trim(StrSplit(A_LoopField, " =$-", 1))
+                str2 := Trim(StrSplit(A_LoopField, " =$-", 2))
+            } else if (InStr(A_LoopField, "=$-")) {
+                str1 := Trim(StrSplit(A_LoopField, "=$-", 1))
+                str2 := Trim(StrSplit(A_LoopField, "=$-", 2))
+            }
+            str_size_name.add(str1)
+            Loop, str_names.size() {
+                if (str2 = str_names[A_Index]) {
+                    str_name_size_num.add(STR(str_size[A_Index]))
+                    break
+                }
+            }
+        }
+        else {
+            code_out .= A_LoopField . Chr(10)
+        }
+    }
+    
+    code := Trim(code_out)
+
+    Loop, str_names.size() {
+        code := RegExReplace(code, "\b" . str_names[A_Index] . "\b", str_names_arrd[A_Index])
+    }
+
+    Loop, str_size_name.size() {
+        code := RegExReplace(code, "\b" . str_size_name[A_Index] . "\b", str_name_size_num[A_Index])
+    }
+
+    Loop, equ_names.size() {
+        str safe_name := StrReplace(equ_names[A_Index], ".", "\.")
+        code := RegExReplace(code, "\b" . safe_name . "\b", equ_values[A_Index])
+    }
+
+    set_first_pass(true)
+    uint64 mock_address := header.size()
+
+    Loop, Parse, code, `n, `r {
+        str line := Trim(A_LoopField)
+        if (line = "") { continue }
+
+        if (RegExMatch(line, "^\s*([a-zA-Z._][a-zA-Z0-9$_.]*):")) {
+            str label_name := StrReplace(line, ":", "")
+             
+            if (line = "_start:") {
+                save_start_temp := size_to_hex64(4194304 + mock_address)
+                Loop, Parse, save_start_temp, " " {
+                    if (A_Index = 0) { header[24] := A_LoopField }
+                    else if (A_Index = 1) { header[25] := A_LoopField }
+                    else if (A_Index = 2) { header[26] := A_LoopField }
+                    else if (A_Index = 3) { header[27] := A_LoopField }
+                }
+            } else {
+                add_label(label_name, 4194304 + mock_address)
+            }
+        } else {
+            set_current_address(mock_address)
+            temp_encode_out := encode(line)
+            int bc := get_byte_count(temp_encode_out)
+            mock_address := mock_address + bc
+        }
+    }
+
+    set_first_pass(false)
+
+    Loop, Parse, code, `n, `r {
+        str line := Trim(A_LoopField)
+        if (line = "") { continue }
+
+        if (RegExMatch(line, "^\s*([a-zA-Z._][a-zA-Z0-9$_.]*):")) {
+            continue 
+        } else {
+            set_current_address(header.size())
+            temp_encode_out := encode(line)
+
+            if (temp_encode_out = "NULL") {
+                error_line := line
+                return 1
+            }
+
+            Loop, Parse, temp_encode_out, " " {
+                if (Trim(A_LoopField) != "") {
+                    header.add(Trim(A_LoopField))
+                }
+            }
+        }
+    }
+
+    ; --- THE FINAL HEADER SIZE WRITES ---
+    ; Segment 1 (File Data + Code)
+    arr str file_size_hex := size_to_hex32(header.size())
+    header[96]  := file_size_hex[0]
+    header[97]  := file_size_hex[1]
+    header[98]  := file_size_hex[2]
+    header[99]  := file_size_hex[3]
+
+    header[104] := file_size_hex[0]
+    header[105] := file_size_hex[1]
+    header[106] := file_size_hex[2]
+    header[107] := file_size_hex[3]
+
+    ; Segment 2 (BSS)
+    if (total_bss_size > 0) {
+        arr str bss_size_hex := size_to_hex32(total_bss_size)
+        header[160] := bss_size_hex[0]
+        header[161] := bss_size_hex[1]
+        header[162] := bss_size_hex[2]
+        header[163] := bss_size_hex[3]
+    }
+
+    final_assemble(file_name, header)
+    print("HTLL-Assembler: Success")
+    return 0
+}
+
+;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;
+
+func void main_assembler(str code, str paramsTemp_fileName) {
+
+    ; Reset those global variables.
+    HT_LIB_theIdNumOfThe34 := 0
+    HT_Lib_theIdNumOfThe34theVar := []
+    
+    int assembler_out := 0
+    assembler_out := assembler(code, paramsTemp_fileName)
+    if (assembler_out = 0) {   
+        print("Compilation finished: " . paramsTemp_fileName . " generated.")
+    }
+    else {
+       print("Assembling failed. Something went wrong.")
+       print("This is line that caused it:")
+       print(error_line)
+    }
+}
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+main
+str params := Trim(GetParams())
+str paramsTemp := ""
+str paramsTemp_fileName := ""
+
+int enable_custom_assembler_x86_64_linux := 1
+
+
+
+if (params = "") {
+        print("Usage:" . Chr(10) . "./Tundra_assembler your_file.s" . Chr(10))
+    }
+
+    else {
+    
+        Loop, Parse, params, `n, `r {
+            paramsTemp := Trim(A_LoopField)
+            if (A_Index = 0) {
+
+                    paramsTemp_fileName := Trim(StringTrimRight(paramsTemp, 2)) 
+                    main_assembler(FileRead(Trim(paramsTemp)), paramsTemp_fileName)                     
+                    break
+            }
+
+        }
+    }
